@@ -3,31 +3,38 @@ use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::execution_engine::{ExecutionEngine, JitFunction};
 use inkwell::module::{self, Module};
-use inkwell::targets::{CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine};
+use inkwell::targets::{
+    CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
+};
 use inkwell::types::PointerType;
 use inkwell::values::BasicValue;
 use inkwell::{types, AddressSpace, OptimizationLevel};
 
 use std::error::Error;
-use std::io::Read;
+use std::io::{self, Read};
 use std::ops::Add;
+use std::os::fd::AsRawFd;
 
 type BfFunc = unsafe extern "C" fn() -> *mut u8;
 
 const VALID_BF: [char; 8] = ['+', '-', '<', '>', '[', ']', ',', '.'];
-// 
+const POLL_STDIN: bool = true;
+//
 fn count_chars_of_type(test_str: &str, match_to: char) -> (u64, u64) {
     let mut r = 0;
     let mut last_valid = 0;
-    for c in test_str.chars().enumerate().filter(|c| VALID_BF.contains(&c.1)) {
+    for c in test_str
+        .chars()
+        .enumerate()
+        .filter(|c| VALID_BF.contains(&c.1))
+    {
         if c.1 != match_to {
-            return (r, last_valid+1)
+            return (r, last_valid + 1);
         }
         last_valid = c.0 as u64;
         r += 1;
     }
-    (r, last_valid+1)
-    
+    (r, last_valid + 1)
 }
 struct CodeGen<'ctx> {
     context: &'ctx Context,
@@ -40,7 +47,11 @@ const STACK_SIZE: u32 = u16::MAX as u32;
 impl<'ctx> CodeGen<'ctx> {
     fn new_jit(context: &'ctx Context) -> Self {
         let module = context.create_module("brain_fucked_jit");
-        let exe = Some(module.create_jit_execution_engine(OptimizationLevel::None).unwrap());
+        let exe = Some(
+            module
+                .create_jit_execution_engine(OptimizationLevel::None)
+                .unwrap(),
+        );
         Self {
             context,
             module,
@@ -49,21 +60,22 @@ impl<'ctx> CodeGen<'ctx> {
             target_machine: None,
         }
     }
-    fn new_comp(context: &'ctx Context) -> Self{
+    fn new_comp(context: &'ctx Context) -> Self {
         let module = context.create_module("brain_fucked_comp");
         Target::initialize_all(&InitializationConfig::default());
         let target_triple = TargetMachine::get_default_triple();
         let target = Target::from_triple(&target_triple).unwrap();
         let target_machine = target
-                .create_target_machine(
-                    &target_triple,
-                    "generic",
-                    "",
-                    OptimizationLevel::Default,
-                    RelocMode::Default,
-                    CodeModel::Default,
-                ).unwrap();
-        Self{
+            .create_target_machine(
+                &target_triple,
+                "generic",
+                "",
+                OptimizationLevel::Default,
+                RelocMode::Default,
+                CodeModel::Default,
+            )
+            .unwrap();
+        Self {
             context,
             module,
             builder: context.create_builder(),
@@ -71,7 +83,7 @@ impl<'ctx> CodeGen<'ctx> {
             target_machine: Some(target_machine),
         }
     }
-    fn gen_bf(&self, code_to_comp: String, do_free : bool) {
+    fn gen_bf(&self, code_to_comp: String, do_free: bool) {
         // Define putchar and getchar function
 
         let putchar = self.module.add_function(
@@ -282,12 +294,23 @@ impl<'ctx> CodeGen<'ctx> {
                 }
                 ',' => {
                     index += 1;
-                    let received_char = self.builder.build_call(getchar, &[], "gotChar").unwrap();
+
+                    let received_char = self
+                        .builder
+                        .build_call(getchar, &[], "gotChar")
+                        .unwrap()
+                        .try_as_basic_value()
+                        .left()
+                        .unwrap()
+                        .into_int_value();
+                    let received_char = self.builder.build_int_truncate(
+                        received_char,
+                        self.context.i8_type(),
+                        "gotChar",
+                    ).unwrap();
+
                     let (stack_ptr, _) = deref_stack();
-                    self.builder.build_store(
-                        stack_ptr,
-                        received_char.try_as_basic_value().left().unwrap(),
-                    );
+                    self.builder.build_store(stack_ptr, received_char);
                 }
                 _ => {
                     index += 1;
@@ -295,9 +318,11 @@ impl<'ctx> CodeGen<'ctx> {
             }
         }
 
-        if do_free{
+        if do_free {
             self.builder.build_free(og_stack).unwrap();
-            self.builder.build_return(Some(&self.context.i32_type().const_int(0, false))).unwrap();
+            self.builder
+                .build_return(Some(&self.context.i32_type().const_int(0, false)))
+                .unwrap();
             return;
         }
         self.builder.build_return(Some(&og_stack)).unwrap();
@@ -306,15 +331,25 @@ impl<'ctx> CodeGen<'ctx> {
     pub fn jit_compile_bf(context: &'ctx Context, code_to_comp: String) {
         let obj = Self::new_jit(context);
         obj.gen_bf(code_to_comp, false);
-        let main: JitFunction<'ctx, BfFunc> = unsafe{obj.execution_engine.as_ref().unwrap().get_function("main").unwrap()};
-        unsafe{main.call()};
+
+        let main: JitFunction<'ctx, BfFunc> = unsafe {
+            obj.execution_engine
+                .as_ref()
+                .unwrap()
+                .get_function("main")
+                .unwrap()
+        };
+
+        let x: *mut u8 = unsafe { main.call() };
     }
-    pub fn compile_bf_to_file(context: &'ctx Context, file: String, code_to_comp: String){
+    pub fn compile_bf_to_file(context: &'ctx Context, file: String, code_to_comp: String) {
         let obj = Self::new_comp(context);
         obj.gen_bf(code_to_comp, true);
 
         let target_machine = obj.target_machine.as_ref().unwrap();
-        target_machine.write_to_file(&obj.module, FileType::Object, file.as_ref()).unwrap();
+        target_machine
+            .write_to_file(&obj.module, FileType::Object, file.as_ref())
+            .unwrap();
     }
 }
 
@@ -323,14 +358,12 @@ fn main() {
     let mut bf_code = String::new();
     stdin.read_to_string(&mut bf_code);
 
-    
     let mut args: Vec<String> = std::env::args().collect();
     // No args = jit
-    if (args.len() == 1){
+    if (args.len() == 1) {
         return CodeGen::jit_compile_bf(&Context::create(), bf_code);
     }
     // Otherwise the .o file to output to
 
-    return CodeGen::compile_bf_to_file(&Context::create(), args[1].clone(), bf_code)
-    
+    return CodeGen::compile_bf_to_file(&Context::create(), args[1].clone(), bf_code);
 }
